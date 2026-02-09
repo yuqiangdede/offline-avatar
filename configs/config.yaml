@@ -1,0 +1,46 @@
+# File: offline-avatar/configs/config.yaml
+providers:
+  asr: faster_whisper_small
+  llm: openai_compat_local
+  tts: pyttsx3
+  avatar: lite_avatar
+
+audio:
+  sample_rate: 16000
+
+webrtc:
+  video_codec: vp8
+  fps: 20
+  width: 1280
+  height: 720
+  force_interface_ip: 10.46.71.33
+  consent_interval_s: 5
+  consent_failures: 120
+
+avatar:
+  default_asset: assets/avatars/P1_4nURxeVKvzaVTealb-UJg.zip
+  fallback_resolution: 720p
+  lite_avatar_cli: "python models/lite-avatar/lite_avatar.py --use_gpu"
+  gpu_index: 0
+  ffmpeg_path: models/ffmpeg-7.1.1-full_build/bin/ffmpeg.exe
+
+llm:
+  endpoint: http://localhost:1234/api/v1/chat
+  model: qwen/qwen3-4b-2507
+  timeout_s: 60
+  system_prompt_zh: 你是一个离线数字人助手。请简洁、准确地回答。请不要使用任何表情符号或颜文字。
+  system_prompt_en: You are an offline digital human assistant. Reply concisely and accurately.
+
+asr:
+  model_size: assets/faster-whisper-small
+  device: cuda
+  compute_type: float16
+  device_index: 0
+
+tts:
+  rate: 185
+  volume: 1.0
+
+runtime:
+  temp_dir: runtime/tmp
+  modelscope_cache_dir: runtime/cache/modelscope
