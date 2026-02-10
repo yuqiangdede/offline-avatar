@@ -1,30 +1,42 @@
 <!-- File: offline-avatar/docs/provider-protocol.md -->
 # Provider 标准协议（ASR / LLM / TTS）
 
-本文定义后端编排层与 Provider 的标准交互协议（v1）。后续新增实现请严格遵循该协议，避免改动 `apps/server/session.py` 主流程。
+本文定义 `apps/server/session.py` 与 Provider 的标准交互协议（v1.1）。  
+目标是“新增/替换 Provider 不改主流程”，仅通过配置切换实现。
 
-## 通用约束
+## 1. 适用范围
+
+- 适用于 `modules/core/interfaces.py` 中的：
+  - `ASRProvider`
+  - `LLMProvider`
+  - `TTSProvider`
+- 不包含 `AvatarProvider`（其协议另行维护）。
+
+## 2. 通用约束
 
 - 语言码统一为 `zh` 或 `en`。
-- Provider 发生错误时：抛出异常（`raise Exception(...)`），由编排层统一降级与告警。
-- Provider 接口保持同步函数签名，由编排层通过 `asyncio.to_thread(...)` 异步调度。
-- 所有返回值必须是可 JSON 序列化结构（除 `bytes` 二进制字段）。
+- 接口保持同步函数签名；由编排层通过 `asyncio.to_thread(...)` 调度。
+- 出错必须抛异常（`raise`），不要吞错后返回伪成功结果。
+- 文本字段必须是 `str`，不要返回 `None`。
+- 除音频二进制字段（`bytes`）外，返回内容应为可序列化基础类型。
+- Provider 内可以做上游协议适配，但对外必须满足本文返回约定。
 
-## ASR 协议
+## 3. ASR 协议
 
 接口定义：
 
 ```python
 class ASRProvider:
-    def transcribe(self, audio_bytes: bytes, sample_rate: int) -> dict
+    def transcribe(self, audio_bytes: bytes, sample_rate: int) -> dict:
+        ...
 ```
 
 输入：
 
-- `audio_bytes`: `PCM S16LE`、`mono`、小端字节流。
-- `sample_rate`: 输入 PCM 采样率（当前主流程默认 16000）。
+- `audio_bytes`: `PCM S16LE`、`mono`、little-endian 字节流。
+- `sample_rate`: 输入采样率（当前主流程默认 `16000`）。
 
-输出（必须字段）：
+输出（必填）：
 
 ```json
 {
@@ -33,7 +45,7 @@ class ASRProvider:
 }
 ```
 
-输出（可选字段）：
+输出（可选）：
 
 ```json
 {
@@ -46,54 +58,60 @@ class ASRProvider:
 约束：
 
 - `text` 允许为空字符串（表示未识别到有效文本）。
-- `lang` 必须归一化为 `zh|en`，不要返回 `zh-cn`、`en-us`。
-- `segments` 若提供，`start/end` 使用秒（float）。
+- `lang` 必须归一化为 `zh|en`，不要返回 `zh-cn/en-us`。
+- `segments` 若提供：
+  - `start/end` 单位是秒（`float`）；
+  - `text` 为 `str`；
+  - 建议按时间递增。
+- 建议空输入直接返回：`{"text": "", "lang": "zh", "segments": []}`。
 
-## LLM 协议
+## 4. LLM 协议
 
 接口定义：
 
 ```python
 class LLMProvider:
-    def chat(self, messages: list, lang: str, stream: bool = False)
+    def chat(self, messages: list, lang: str, stream: bool = False):
+        ...
 ```
 
 输入：
 
-- `messages`: 对话上下文，OpenAI 风格结构：
-  - `{"role":"user|assistant|system","content":"..."}`
-- `lang`: 本轮目标回复语言（`zh|en`）。
+- `messages`: OpenAI 风格消息数组，元素结构：
+  - `{"role": "user|assistant|system", "content": "..."}`
+- `lang`: 目标回复语言（`zh|en`）。
 - `stream`: 是否流式输出。
 
-输出（非流式，`stream=False`）：
+输出（`stream=False`）：
 
-- 返回 `str`（完整回复文本）。
+- 返回完整回复 `str`。
 
-输出（流式，`stream=True`）：
+输出（`stream=True`）：
 
-- 返回 `iterator[str]`，每次 `yield` 一个增量文本片段（delta）。
+- 返回 `Iterator[str]`，每次 `yield` 增量文本（delta）。
 
 约束：
 
-- 即便上游接口是 OpenAI-compat，也要在 Provider 内完成字段适配（例如本地接口只接受 `model/system_prompt/input`）。
-- 若响应结构复杂（如 `output` 为数组），Provider 必须在内部提取为最终 `str`。
-- 返回空字符串表示“无可用回复”，不建议返回 `None`。
+- Provider 需要在内部适配不同上游返回结构（例如 `choices[]/output/text`）。
+- 不返回 `None`；无可用内容时返回空字符串 `""`。
+- 流式模式下，建议只 `yield` 非空增量字符串。
 
-## TTS 协议
+## 5. TTS 协议
 
 接口定义：
 
 ```python
 class TTSProvider:
-    def synthesize(self, text: str, lang: str) -> dict
+    def synthesize(self, text: str, lang: str) -> dict:
+        ...
 ```
 
 输入：
 
-- `text`: 要合成的单句或短文本。
+- `text`: 句子或短文本。
 - `lang`: 发音语言（`zh|en`）。
 
-输出（必须字段）：
+输出（必填）：
 
 ```json
 {
@@ -104,30 +122,47 @@ class TTSProvider:
 
 约束：
 
-- `pcm_s16le` 必须是 `PCM S16LE`、`mono`、小端。
+- `pcm_s16le` 必须为 `PCM S16LE`、`mono`、little-endian。
 - `sample_rate` 必须是正整数。
-- 允许返回空音频（`pcm_s16le=b""`），编排层会跳过该句。
-- 若输出采样率非 16k，编排层会重采样到 WebRTC 音轨采样率。
+- 空文本可返回空音频：`{"pcm_s16le": b"", "sample_rate": 16000}`。
+- 编排层会处理重采样与降级，不要求 TTS 端固定 16k。
 
-## 编排层调用顺序（规范）
+## 6. 与当前编排层实现的对齐点
 
-语音输入：
+以 `apps/server/session.py` 当前逻辑为准：
 
-1. `ASR.transcribe(...)`
-2. `LLM.chat(..., stream=False|True)`
-3. 按标点切句
-4. 每句调用 `TTS.synthesize(...)`
-5. 将每句音频送入 Avatar 渲染与 WebRTC 推流
+- ASR：
+  - 主流程只强依赖 `text/lang`；
+  - `segments` 为可选扩展字段。
+- LLM：
+  - 当前主流程调用 `chat(..., stream=False)`；
+  - `llm.delta` 事件预留，后续可接流式。
+- TTS：
+  - 主流程只依赖 `pcm_s16le/sample_rate`；
+  - 空音频会触发降级策略（备用语音/提示音）。
 
-文本输入：
+## 7. Provider 标识与配置对齐
 
-1. 跳过 ASR
-2. 直接进入 LLM -> 分句 -> TTS -> Avatar
+`configs/app.yaml` 中已对齐如下标识：
 
-## 新 Provider 接入验收清单
+- `providers.asr: faster_whisper_small`
+- `providers.llm: openai_compat_local`
+- `providers.tts: pyttsx3`
 
-- ASR：返回 `text/lang` 且 `lang` 为 `zh|en`。
-- LLM：非流式返回 `str`；流式返回 `iterator[str]`。
-- TTS：返回 `pcm_s16le(bytes)` + `sample_rate(int)`。
-- 异常路径：故障时抛异常，不吞错；日志包含错误原因。
-- 实测：文本输入与语音输入各跑通 1 次，`chat.append` 与 `metric` 正常上报。
+新增 Provider 时，需同时完成：
+
+1. 新实现类（`modules/.../provider.py`）
+2. 构建函数分支（`apps/server/session.py` 中 `_build_*_provider`）
+3. `configs/app.yaml` 的 provider 名称
+4. README 使用说明
+
+## 8. 接入验收清单
+
+- ASR：返回 `text/lang`，且 `lang in {"zh","en"}`。
+- LLM：非流式返回 `str`；流式返回 `Iterator[str]`。
+- TTS：返回 `pcm_s16le(bytes)` 与 `sample_rate(int)`。
+- 异常路径：故障时抛异常，日志可定位原因。
+- 联调通过：
+  - 文本输入链路（`input.text`）跑通；
+  - 语音输入链路（`input.audio`）跑通；
+  - 前端可收到 `chat.append` / `metric` / `llm.final`（以及 ASR 场景的 `asr.final`）。
