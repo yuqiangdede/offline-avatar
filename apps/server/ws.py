@@ -8,8 +8,8 @@ from typing import Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from apps.server.session import Session
-from packages.core import events
-from packages.core.config import AppConfig
+from modules.core import events
+from modules.core.config import AppConfig
 
 logger = logging.getLogger(__name__)
 

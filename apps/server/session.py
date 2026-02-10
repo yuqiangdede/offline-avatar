@@ -21,13 +21,13 @@ import numpy as np
 
 from apps.server.metrics import Metrics
 from apps.server.webrtc import WebRTCTransport
-from packages.core import events
-from packages.core.config import AppConfig, ensure_project_dir, resolve_project_path
-from packages.core.interfaces import ASRProvider, AvatarProvider, LLMProvider, TTSProvider
-from packages.providers.asr_faster_whisper import FasterWhisperProvider
-from packages.providers.avatar_lite_avatar import LiteAvatarProvider
-from packages.providers.llm_openai_compat import OpenAICompatLocalProvider
-from packages.providers.tts_pyttsx3 import Pyttsx3Provider
+from modules.core import events
+from modules.core.config import AppConfig, ensure_project_dir, resolve_project_path
+from modules.core.interfaces import ASRProvider, AvatarProvider, LLMProvider, TTSProvider
+from modules.asr.faster_whisper import FasterWhisperProvider
+from modules.avatar.lite_avatar import LiteAvatarProvider
+from modules.llm.openai_adapter import OpenAICompatLocalProvider
+from modules.tts.edge_tts import Pyttsx3Provider
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +49,18 @@ def _detect_lang(text: str) -> str:
 def _override_lang_from_text(text: str) -> str | None:
     lowered = (text or "").lower()
 
-    zh_rules = ["用中文回答", "请用中文回答", "用中文回复", "中文回答", "reply in chinese", "answer in chinese"]
-    en_rules = ["用英文回答", "请用英文回答", "用英语回答", "英文回答", "reply in english", "answer in english"]
+    zh_rules = [
+        "\u7528\u4e2d\u6587\u56de\u7b54",
+        "\u8bf7\u7528\u4e2d\u6587\u56de\u7b54",
+        "reply in chinese",
+        "answer in chinese",
+    ]
+    en_rules = [
+        "\u7528\u82f1\u6587\u56de\u7b54",
+        "\u8bf7\u7528\u82f1\u6587\u56de\u7b54",
+        "reply in english",
+        "answer in english",
+    ]
 
     if any(rule in lowered for rule in zh_rules):
         return "zh"
@@ -62,10 +72,64 @@ def _override_lang_from_text(text: str) -> str | None:
 def _split_sentences(text: str) -> list[str]:
     if not text:
         return []
-    parts = re.split(r"(?<=[。！？；.!?])", text)
-    cleaned = [p.strip() for p in parts if p and p.strip()]
-    return cleaned if cleaned else [text.strip()]
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
 
+    major_parts = re.split(r"(?<=[\u3002\uff01\uff1f\uff1b.!?])", normalized)
+    chunks: list[str] = []
+    max_chunk_chars = 48
+
+    for major in major_parts:
+        major = major.strip()
+        if not major:
+            continue
+        if len(major) <= max_chunk_chars:
+            chunks.append(major)
+            continue
+
+        # If one sentence is too long, split again by pause punctuation first.
+        minor_parts = re.split(r"(?<=[\uff0c,\u3001\uff1a:])", major)
+        for minor in minor_parts:
+            minor = minor.strip()
+            if not minor:
+                continue
+            if len(minor) <= max_chunk_chars:
+                chunks.append(minor)
+                continue
+            # Hard split as a final fallback for long no-punctuation text.
+            start = 0
+            while start < len(minor):
+                end = min(start + max_chunk_chars, len(minor))
+                piece = minor[start:end].strip()
+                if piece:
+                    chunks.append(piece)
+                start = end
+
+    return chunks if chunks else [normalized]
+
+
+def _merge_short_sentences(sentences: list[str], min_chars: int) -> list[str]:
+    cleaned = [s.strip() for s in sentences if s and s.strip()]
+    if min_chars <= 1 or len(cleaned) <= 1:
+        return cleaned
+
+    merged: list[str] = []
+    idx = 0
+    while idx < len(cleaned):
+        cur = cleaned[idx]
+        if len(cur) < min_chars and idx + 1 < len(cleaned):
+            nxt = cleaned[idx + 1]
+            # Keep space only for latin-word boundaries.
+            if re.search(r"[A-Za-z0-9]$", cur) and re.match(r"^[A-Za-z0-9]", nxt):
+                merged.append(f"{cur} {nxt}")
+            else:
+                merged.append(f"{cur}{nxt}")
+            idx += 2
+            continue
+        merged.append(cur)
+        idx += 1
+    return merged
 
 def _align_frames_to_audio(frames: list[av.VideoFrame], target_frames: int) -> list[av.VideoFrame]:
     target = max(1, int(target_frames))
@@ -79,14 +143,147 @@ def _align_frames_to_audio(frames: list[av.VideoFrame], target_frames: int) -> l
     return frames + [last] * (target - len(frames))
 
 
-def _prefer_single_avatar_render(avatar: AvatarProvider) -> bool:
-    """
-    Lite-Avatar CLI has high process startup cost. Rendering per sentence causes
-    repeated model load and very high CPU time.
-    """
-    if not isinstance(avatar, LiteAvatarProvider):
-        return False
-    return bool((avatar.lite_avatar_cli or "").strip())
+def _pcm_rms_s16le(pcm_s16le: bytes) -> int:
+    if not pcm_s16le:
+        return 0
+    try:
+        return int(audioop.rms(pcm_s16le, 2))
+    except Exception:
+        return 0
+
+
+def _build_tone_pcm_s16le(duration_s: float, sample_rate: int, freq_hz: float = 220.0) -> bytes:
+    duration = max(0.2, float(duration_s))
+    sr = max(8000, int(sample_rate))
+    t = np.arange(int(duration * sr), dtype=np.float32) / float(sr)
+    # Short fade-in/out to avoid click noise.
+    fade_len = max(1, int(0.02 * sr))
+    env = np.ones_like(t)
+    env[:fade_len] = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+    env[-fade_len:] = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+    wave_np = np.sin(2.0 * np.pi * float(freq_hz) * t) * env
+    return (wave_np * 7000.0).astype(np.int16).tobytes()
+
+
+def _pad_pcm_tail_silence_s16le(pcm_s16le: bytes, sample_rate: int, min_duration_s: float) -> bytes:
+    if not pcm_s16le:
+        return pcm_s16le
+    sr = max(8000, int(sample_rate))
+    target_samples = int(max(0.0, float(min_duration_s)) * sr)
+    cur_samples = len(pcm_s16le) // 2
+    if cur_samples >= target_samples:
+        return pcm_s16le
+    need_samples = target_samples - cur_samples
+    return pcm_s16le + (b"\x00" * need_samples * 2)
+
+def _trim_pcm_silence_s16le(
+    pcm_s16le: bytes,
+    sample_rate: int,
+    frame_ms: int = 20,
+    min_rms: int = 70,
+    keep_lead_ms: int = 120,
+    keep_tail_ms: int = 120,
+    max_side_trim_ms: int = 280,
+    min_keep_ratio: float = 0.85,
+) -> bytes:
+    if not pcm_s16le:
+        return pcm_s16le
+    sr = max(8000, int(sample_rate))
+    frame_samples = max(1, int(sr * frame_ms / 1000))
+    frame_bytes = frame_samples * 2
+    total = len(pcm_s16le)
+    if total <= frame_bytes * 2:
+        return pcm_s16le
+
+    rms_values: list[int] = []
+    offsets: list[int] = []
+    peak_rms = 0
+    offset = 0
+    while offset < total:
+        chunk = pcm_s16le[offset : min(total, offset + frame_bytes)]
+        rms = _pcm_rms_s16le(chunk)
+        rms_values.append(rms)
+        offsets.append(offset)
+        if rms > peak_rms:
+            peak_rms = rms
+        offset += frame_bytes
+
+    # Dynamic threshold: avoid over-trimming low-volume speech.
+    threshold = max(min_rms, int(peak_rms * 0.08))
+    first_idx = None
+    last_idx = None
+    for i, rms in enumerate(rms_values):
+        if rms >= threshold:
+            first_idx = i
+            break
+    for i in range(len(rms_values) - 1, -1, -1):
+        if rms_values[i] >= threshold:
+            last_idx = i
+            break
+
+    if first_idx is None or last_idx is None or last_idx < first_idx:
+        return pcm_s16le
+
+    keep_lead_bytes = max(0, int(sr * keep_lead_ms / 1000) * 2)
+    keep_tail_bytes = max(0, int(sr * keep_tail_ms / 1000) * 2)
+
+    start = max(0, offsets[first_idx] - keep_lead_bytes)
+    end_base = offsets[last_idx] + frame_bytes
+    end = min(total, end_base + keep_tail_bytes)
+    if end <= start:
+        return pcm_s16le
+
+    max_side_trim_bytes = max(0, int(sr * max_side_trim_ms / 1000) * 2)
+    removed_lead = start
+    removed_tail = total - end
+    if removed_lead > max_side_trim_bytes or removed_tail > max_side_trim_bytes:
+        return pcm_s16le
+
+    trimmed = pcm_s16le[start:end]
+    min_keep_bytes = int(total * max(0.1, min(1.0, float(min_keep_ratio))))
+    if len(trimmed) < min_keep_bytes:
+        return pcm_s16le
+
+    # Avoid aggressive trim on near-silent or too-short result.
+    if len(trimmed) < max(frame_bytes * 2, int(0.25 * sr) * 2):
+        return pcm_s16le
+    return trimmed
+
+
+def _estimate_voice_span_ms(
+    pcm_s16le: bytes,
+    sample_rate: int,
+    frame_ms: int = 20,
+    min_rms: int = 70,
+) -> tuple[int, int]:
+    if not pcm_s16le:
+        return 0, 0
+    sr = max(8000, int(sample_rate))
+    frame_samples = max(1, int(sr * frame_ms / 1000))
+    frame_bytes = frame_samples * 2
+    total = len(pcm_s16le)
+    if total <= frame_bytes:
+        return 0, int(total / float(sr * 2) * 1000)
+
+    first_idx = None
+    last_idx = None
+    idx = 0
+    offset = 0
+    while offset < total:
+        chunk = pcm_s16le[offset : min(total, offset + frame_bytes)]
+        rms = _pcm_rms_s16le(chunk)
+        if rms >= min_rms:
+            if first_idx is None:
+                first_idx = idx
+            last_idx = idx
+        idx += 1
+        offset += frame_bytes
+
+    if first_idx is None or last_idx is None:
+        return 0, 0
+    start_ms = first_idx * frame_ms
+    end_ms = (last_idx + 1) * frame_ms
+    return start_ms, end_ms
 
 
 def _safe_ts_ms() -> int:
@@ -190,7 +387,7 @@ def _build_asr_provider(config: AppConfig) -> ASRProvider:
             compute_type=config.asr.compute_type,
             device_index=config.asr.device_index,
         )
-    raise ValueError(f"未知 ASR Provider: {name}")
+    raise ValueError(f"Unknown ASR Provider: {name}")
 
 
 def _build_llm_provider(config: AppConfig) -> LLMProvider:
@@ -203,7 +400,7 @@ def _build_llm_provider(config: AppConfig) -> LLMProvider:
             system_prompt_zh=config.llm.system_prompt_zh,
             system_prompt_en=config.llm.system_prompt_en,
         )
-    raise ValueError(f"未知 LLM Provider: {name}")
+    raise ValueError(f"Unknown LLM Provider: {name}")
 
 
 def _build_tts_provider(config: AppConfig) -> TTSProvider:
@@ -214,7 +411,7 @@ def _build_tts_provider(config: AppConfig) -> TTSProvider:
             volume=config.tts.volume,
             temp_dir=ensure_project_dir(config, config.runtime.temp_dir),
         )
-    raise ValueError(f"未知 TTS Provider: {name}")
+    raise ValueError(f"Unknown TTS Provider: {name}")
 
 
 def _build_avatar_provider(config: AppConfig) -> AvatarProvider:
@@ -226,6 +423,8 @@ def _build_avatar_provider(config: AppConfig) -> AvatarProvider:
             height=config.webrtc.height,
             lite_avatar_cli=config.avatar.lite_avatar_cli,
             gpu_index=config.avatar.gpu_index,
+            delete_generated_mp4=bool(config.avatar.delete_generated_mp4),
+            delete_generated_audio=bool(config.avatar.delete_generated_audio),
             ffmpeg_path=resolve_project_path(config, config.avatar.ffmpeg_path)
             if (config.avatar.ffmpeg_path or "").strip()
             else "",
@@ -233,7 +432,7 @@ def _build_avatar_provider(config: AppConfig) -> AvatarProvider:
             modelscope_cache_dir=ensure_project_dir(config, config.runtime.modelscope_cache_dir),
             workdir=str(config.project_root),
         )
-    raise ValueError(f"未知 Avatar Provider: {name}")
+    raise ValueError(f"Unknown Avatar Provider: {name}")
 
 
 class Session:
@@ -486,26 +685,43 @@ class Session:
             )
         except Exception:
             logger.exception("Session[%s] LLM failed", self.session_id)
-            assistant_text = "本地 LLM 调用失败，请检查服务状态。" if reply_lang == "zh" else "Local LLM call failed."
+            assistant_text = "Local LLM call failed."
         llm_ms = Metrics.elapsed_ms(llm_start)
         logger.info("Session[%s] LLM elapsed_ms=%s", self.session_id, llm_ms)
 
         if not assistant_text:
-            assistant_text = "我没有获取到可用回复。" if reply_lang == "zh" else "I did not get a usable response."
+            assistant_text = "I did not get a usable response."
             logger.warning("Session[%s] LLM returned empty text", self.session_id)
 
         await self._send({"type": events.WS_TYPE_LLM_FINAL, "text": assistant_text, "ms": llm_ms})
         await self._send_metric("llm_ms", llm_ms)
-
-        await self._append_chat("assistant", assistant_text, reply_lang)
         self.llm_messages.append({"role": "assistant", "content": assistant_text})
+        await self._append_chat("assistant", assistant_text, reply_lang)
 
         sentences = _split_sentences(assistant_text)
-        if _prefer_single_avatar_render(self.avatar):
+        if bool(self.config.avatar.single_pass_render):
             sentences = [assistant_text]
             logger.info(
-                "Session[%s] avatar render mode=single_pass (lite-avatar cli)",
+                "Session[%s] avatar render mode=single_pass (config.avatar.single_pass_render=true)",
                 self.session_id,
+            )
+        else:
+            merge_chars = max(0, int(self.config.avatar.short_chunk_merge_chars))
+            if merge_chars > 1:
+                merged_sentences = _merge_short_sentences(sentences, min_chars=merge_chars)
+                if len(merged_sentences) != len(sentences):
+                    logger.info(
+                        "Session[%s] sentence merge: before=%s after=%s min_chars=%s",
+                        self.session_id,
+                        len(sentences),
+                        len(merged_sentences),
+                        merge_chars,
+                    )
+                sentences = merged_sentences
+            logger.info(
+                "Session[%s] avatar render mode=segmented chunks=%s",
+                self.session_id,
+                len(sentences),
             )
         await self._send_state(events.PHASE_SPEAKING)
 
@@ -539,31 +755,166 @@ class Session:
 
             pcm_s16le = tts_result.get("pcm_s16le", b"")
             sample_rate = int(tts_result.get("sample_rate", self.config.audio.sample_rate))
-            if not pcm_s16le:
-                logger.warning("Session[%s] TTS empty pcm: sentence_idx=%s", self.session_id, idx)
-                continue
+            tts_rms = _pcm_rms_s16le(pcm_s16le)
+            if (not pcm_s16le) or tts_rms < 80:
+                logger.warning(
+                    "Session[%s] TTS empty/silent pcm: sentence_idx=%s bytes=%s rms=%s, apply fallback",
+                    self.session_id,
+                    idx,
+                    len(pcm_s16le),
+                    tts_rms,
+                )
+                try:
+                    fallback_text = "Audio unavailable."
+                    fb = await asyncio.to_thread(self.tts.synthesize, fallback_text, "en")
+                    fb_pcm = fb.get("pcm_s16le", b"")
+                    fb_rate = int(fb.get("sample_rate", self.config.audio.sample_rate))
+                    fb_rms = _pcm_rms_s16le(fb_pcm)
+                    if fb_pcm and fb_rms >= 80:
+                        pcm_s16le = fb_pcm
+                        sample_rate = fb_rate
+                        logger.warning(
+                            "Session[%s] TTS fallback voice used: sentence_idx=%s bytes=%s rms=%s",
+                            self.session_id,
+                            idx,
+                            len(pcm_s16le),
+                            fb_rms,
+                        )
+                    else:
+                        raise RuntimeError("fallback voice is empty/silent")
+                except Exception:
+                    tone_s = max(0.8, min(3.0, len(sentence) * 0.08))
+                    sample_rate = self.config.audio.sample_rate
+                    pcm_s16le = _build_tone_pcm_s16le(tone_s, sample_rate)
+                    logger.warning(
+                        "Session[%s] TTS fallback tone used: sentence_idx=%s duration_s=%.2f",
+                        self.session_id,
+                        idx,
+                        tone_s,
+                    )
 
             avatar_start = Metrics.now()
-            audio_duration_s = len(pcm_s16le) / float(max(1, sample_rate) * 2)
+            before_bytes = len(pcm_s16le)
+            before_dur_s = before_bytes / float(max(1, sample_rate) * 2)
+            if bool(self.config.avatar.trim_tts_silence):
+                pcm_s16le = _trim_pcm_silence_s16le(pcm_s16le=pcm_s16le, sample_rate=sample_rate)
+            after_bytes = len(pcm_s16le)
+            after_dur_s = after_bytes / float(max(1, sample_rate) * 2)
+            if after_bytes != before_bytes:
+                logger.info(
+                    "Session[%s] TTS silence-trim: sentence_idx=%s before_ms=%s after_ms=%s",
+                    self.session_id,
+                    idx,
+                    int(before_dur_s * 1000),
+                    int(after_dur_s * 1000),
+                )
+            logger.info(
+                "Session[%s] TTS audio ready: sentence_idx=%s bytes=%s sample_rate=%s rms=%s",
+                self.session_id,
+                idx,
+                len(pcm_s16le),
+                sample_rate,
+                _pcm_rms_s16le(pcm_s16le),
+            )
+            playback_pcm_s16le = pcm_s16le
+            render_pcm_s16le = playback_pcm_s16le
+            render_sample_rate = sample_rate
+            if isinstance(self.avatar, LiteAvatarProvider):
+                target_render_sr = max(8000, int(self.config.avatar.lite_avatar_render_sample_rate))
+                if render_sample_rate != target_render_sr and len(render_pcm_s16le) > 0:
+                    try:
+                        render_pcm_s16le, _ = audioop.ratecv(
+                            render_pcm_s16le,
+                            2,
+                            1,
+                            render_sample_rate,
+                            target_render_sr,
+                            None,
+                        )
+                        logger.info(
+                            "Session[%s] Lite-Avatar render resample: sentence_idx=%s from_sr=%s to_sr=%s bytes=%s",
+                            self.session_id,
+                            idx,
+                            render_sample_rate,
+                            target_render_sr,
+                            len(render_pcm_s16le),
+                        )
+                        render_sample_rate = target_render_sr
+                    except Exception:
+                        logger.exception(
+                            "Session[%s] Lite-Avatar render resample failed: sentence_idx=%s from_sr=%s to_sr=%s",
+                            self.session_id,
+                            idx,
+                            render_sample_rate,
+                            target_render_sr,
+                        )
+            audio_duration_s = len(playback_pcm_s16le) / float(max(1, sample_rate) * 2)
+            voice_start_ms, voice_end_ms = _estimate_voice_span_ms(playback_pcm_s16le, sample_rate=sample_rate)
+            logger.info(
+                "Session[%s] Audio voice span: sentence_idx=%s total_ms=%s voice_start_ms=%s voice_end_ms=%s voice_dur_ms=%s",
+                self.session_id,
+                idx,
+                int(audio_duration_s * 1000),
+                voice_start_ms,
+                voice_end_ms,
+                max(0, voice_end_ms - voice_start_ms),
+            )
             target_frames = max(1, int(round(audio_duration_s * max(1, self.config.webrtc.fps))))
+            if isinstance(self.avatar, LiteAvatarProvider) and bool((self.avatar.lite_avatar_cli or "").strip()):
+                min_audio_ms = max(0, int(self.config.avatar.lite_avatar_min_audio_ms))
+                cur_audio_ms = int(len(render_pcm_s16le) / float(max(1, render_sample_rate) * 2) * 1000)
+                if min_audio_ms > 0 and cur_audio_ms < min_audio_ms:
+                    render_pcm_s16le = _pad_pcm_tail_silence_s16le(
+                        render_pcm_s16le,
+                        sample_rate=render_sample_rate,
+                        min_duration_s=float(min_audio_ms) / 1000.0,
+                    )
+                    logger.info(
+                        "Session[%s] Lite-Avatar short-audio pad: sentence_idx=%s before_ms=%s target_ms=%s",
+                        self.session_id,
+                        idx,
+                        cur_audio_ms,
+                        min_audio_ms,
+                    )
 
-            def _render_frames() -> list[av.VideoFrame]:
+            def _render_frames() -> tuple[list[av.VideoFrame], int]:
                 rendered = list(
                     self.avatar.render(
-                        pcm_s16le=pcm_s16le,
-                        sample_rate=sample_rate,
+                        pcm_s16le=render_pcm_s16le,
+                        sample_rate=render_sample_rate,
                         avatar_asset=self.avatar_asset,
                     )
                 )
-                return _align_frames_to_audio(rendered, target_frames)
+                raw_count = len(rendered)
+                aligned = _align_frames_to_audio(rendered, target_frames)
+                return aligned, raw_count
 
             try:
-                frames = await asyncio.to_thread(_render_frames)
+                frames, raw_frame_count = await asyncio.to_thread(_render_frames)
                 if not frames:
                     logger.warning("Session[%s] Avatar empty frames: sentence_idx=%s", self.session_id, idx)
                     continue
+                fps = max(1, int(self.config.webrtc.fps))
+                playback_audio_ms = int(audio_duration_s * 1000)
+                render_audio_ms = int(len(render_pcm_s16le) / float(max(1, render_sample_rate) * 2) * 1000)
+                raw_video_ms = int(raw_frame_count * 1000 / fps)
+                out_video_ms = int(len(frames) * 1000 / fps)
+                logger.info(
+                    "Session[%s] AV duration compare: sentence_idx=%s audio_playback_ms=%s audio_render_ms=%s render_sr=%s video_raw_ms=%s video_out_ms=%s delta_out_ms=%s frames_raw=%s frames_out=%s fps=%s",
+                    self.session_id,
+                    idx,
+                    playback_audio_ms,
+                    render_audio_ms,
+                    render_sample_rate,
+                    raw_video_ms,
+                    out_video_ms,
+                    out_video_ms - playback_audio_ms,
+                    raw_frame_count,
+                    len(frames),
+                    fps,
+                )
                 await self.transport.enqueue_av_segment(
-                    pcm_s16le=pcm_s16le,
+                    pcm_s16le=playback_pcm_s16le,
                     sample_rate=sample_rate,
                     frames=frames,
                 )
@@ -596,3 +947,4 @@ class Session:
                 "trace": traceback.format_exc(),
             }
         )
+

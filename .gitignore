@@ -40,12 +40,15 @@ temp/
 .env.*
 !.env.example
 configs/config.local.yaml
+configs/app.local.yaml
 
 # ---- Model / binary artifacts (downloadable) ----
-models/ffmpeg-*/
-models/lite-avatar/weights/
-models/lite-avatar/.modelscope_cache/
-assets/faster-whisper-small/
+third_party/ffmpeg/
+modules/avatar/lite_avatar/weights/
+modules/avatar/lite_avatar/.modelscope_cache/
+models/faster-whisper-small/
+models/lite-avatar/*.zip
+models/lite-avatar/P1_*/
 *.onnx
 *.pt
 *.pth

@@ -23,7 +23,7 @@ from aiortc.mediastreams import MediaStreamError
 from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 from av import VideoFrame
 
-from packages.core.config import AppConfig
+from modules.core.config import AppConfig
 
 SignalSender = Callable[[dict[str, Any]], Awaitable[None]]
 logger = logging.getLogger(__name__)
@@ -145,7 +145,10 @@ class QueueAudioTrack(MediaStreamTrack):
         # 60s buffer by default (frame_ms=20 -> 3000 chunks).
         self.queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=max(3000, int(60000 / frame_ms)))
         self._timestamp = 0
+        self._started_at: float | None = None
         self._sent_count = 0
+        self._last_log_ts: float | None = None
+        self._last_log_count = 0
 
     async def enqueue_pcm(self, pcm_s16le: bytes, sample_rate: int) -> None:
         if not pcm_s16le:
@@ -166,10 +169,21 @@ class QueueAudioTrack(MediaStreamTrack):
         if self.readyState != "live":
             raise MediaStreamError
 
+        if self._started_at is None:
+            self._started_at = time.time()
+            self._timestamp = 0
+        else:
+            self._timestamp += self.frame_samples
+
+        target = self._started_at + (self._timestamp / float(self.sample_rate))
+        delay = target - time.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
         try:
-            chunk = await asyncio.wait_for(self.queue.get(), timeout=0.02)
+            chunk = self.queue.get_nowait()
             used_silence = False
-        except asyncio.TimeoutError:
+        except asyncio.QueueEmpty:
             chunk = b"\x00" * self.frame_bytes
             used_silence = True
 
@@ -183,15 +197,26 @@ class QueueAudioTrack(MediaStreamTrack):
         frame.sample_rate = self.sample_rate
         frame.pts = self._timestamp
         frame.time_base = Fraction(1, self.sample_rate)
-        self._timestamp += frame.samples
         self._sent_count += 1
         if self._sent_count == 1 or self._sent_count % 250 == 0:
+            now = time.time()
+            if self._last_log_ts is not None and self._sent_count > self._last_log_count:
+                elapsed_ms = int((now - self._last_log_ts) * 1000)
+                frame_delta = self._sent_count - self._last_log_count
+                avg_frame_ms = int(elapsed_ms / max(1, frame_delta))
+            else:
+                avg_frame_ms = -1
+            queued_ms = int(self.queue.qsize() * self.frame_samples * 1000 / max(1, self.sample_rate))
             logger.info(
-                "WebRTC audio recv: sent=%s queue=%s silence=%s",
+                "WebRTC audio recv: sent=%s queue=%s queued_ms=%s silence=%s avg_frame_ms=%s",
                 self._sent_count,
                 self.queue.qsize(),
+                queued_ms,
                 used_silence,
+                avg_frame_ms,
             )
+            self._last_log_ts = now
+            self._last_log_count = self._sent_count
         return frame
 
 

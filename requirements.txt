@@ -1,3 +1,3 @@
 # File: offline-avatar/requirements.txt
 -r requirements.base.txt
--r models/lite-avatar/requirements.txt
+-r modules/avatar/lite_avatar/requirements.txt

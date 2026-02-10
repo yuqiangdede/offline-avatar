@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from apps.server.ws import WSApp  # noqa: E402
-from packages.core.config import ensure_project_dir, load_config  # noqa: E402
+from modules.core.config import ensure_project_dir, load_config  # noqa: E402
 
 logger = logging.getLogger(__name__)
 _AIOICE_ORIG_GET_HOST_ADDRESSES = aioice_ice.get_host_addresses
@@ -100,7 +100,7 @@ def setup_webrtc_network_env(config) -> None:
 def create_app() -> FastAPI:
     setup_logging()
     setup_media_logging()
-    config = load_config(ROOT / "configs" / "config.yaml")
+    config = load_config(ROOT / "configs" / "app.yaml")
     setup_runtime_env(config)
     setup_webrtc_network_env(config)
     logger.info(
